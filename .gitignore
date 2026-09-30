@@ -20,3 +20,5 @@ storage/outputs/*
 *.log
 .DS_Store
 Thumbs.db
+
+storage/subtitles/*
