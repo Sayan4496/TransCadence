@@ -31,6 +31,7 @@ def transcribe_audio(audio_path: Path) -> dict:
         str(audio_path),
         language="en",
         vad_filter=True,
+        word_timestamps=True,
     )
 
     transcript_segments = []
@@ -40,6 +41,16 @@ def transcribe_audio(audio_path: Path) -> dict:
 
         if not text:
             continue
+
+        words = [
+            {
+                "word": word.word,
+                "start": round(word.start, 3),
+                "end": round(word.end, 3),
+            }
+            for word in (segment.words or [])
+            if word.word.strip()
+        ]
 
         transcript_segments.append(
             {
@@ -51,6 +62,7 @@ def transcribe_audio(audio_path: Path) -> dict:
                     3,
                 ),
                 "text": text,
+                "words": words,
             }
         )
 

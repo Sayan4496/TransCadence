@@ -6,6 +6,8 @@ __pycache__/
 
 .env
 .env.*
+backend/.env
+!backend/.env.example
 
 storage/uploads/*
 storage/audio/*

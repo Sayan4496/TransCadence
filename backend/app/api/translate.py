@@ -1,4 +1,5 @@
 import json
+import logging
 from pathlib import Path
 from uuid import UUID
 
@@ -7,7 +8,16 @@ from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
 from backend.app.services.translation_service import (
+    GeminiAuthenticationError,
+    GeminiModelConfigurationError,
+    GeminiModelUnavailableError,
+    GeminiNetworkError,
+    GeminiQuotaError,
+    GeminiResponseError,
+    GeminiTimeoutError,
     LANGUAGE_NAMES,
+    GeminiTranslationError,
+    MissingGeminiAPIKeyError,
     translate_segments,
 )
 
@@ -15,6 +25,27 @@ from backend.app.services.translation_service import (
 router = APIRouter(prefix="/api/jobs", tags=["Translation"])
 TRANSCRIPT_DIR = Path("storage/transcripts")
 TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
+logger = logging.getLogger(__name__)
+
+
+def _translation_failure(exc: GeminiTranslationError) -> tuple[int, str]:
+    if isinstance(exc, MissingGeminiAPIKeyError):
+        return 503, "Translation service is not configured on the server."
+    if isinstance(exc, GeminiModelConfigurationError):
+        return 503, "The configured Gemini model is not allowed by server policy."
+    if isinstance(exc, GeminiAuthenticationError):
+        return 502, "Gemini rejected the server's API credentials."
+    if isinstance(exc, GeminiQuotaError):
+        return 429, "Gemini quota or rate limit reached. Please retry later."
+    if isinstance(exc, GeminiModelUnavailableError):
+        return 503, "The configured Gemini model is unavailable to this API account."
+    if isinstance(exc, GeminiTimeoutError):
+        return 504, "Gemini timed out while translating. Please retry shortly."
+    if isinstance(exc, GeminiNetworkError):
+        return 502, "The Gemini API could not complete the translation request."
+    if isinstance(exc, GeminiResponseError):
+        return 502, "Gemini returned an empty, invalid, or non-Hindi response."
+    return 502, "Gemini translation failed."
 
 
 class TranslationRequest(BaseModel):
@@ -76,13 +107,24 @@ async def translate_job(job_id: str, request: TranslationRequest):
                 indent=2,
                 ensure_ascii=False,
             )
+    except GeminiTranslationError as exc:
+        diagnostic = type(exc).__name__
+        if isinstance(exc, GeminiNetworkError):
+            diagnostic += (
+                f" api_code={exc.api_code}"
+                f" api_status={exc.api_status or 'unknown'}"
+            )
+        logger.error("Hindi translation failed (%s)", diagnostic)
+        status_code, safe_detail = _translation_failure(exc)
+        raise HTTPException(status_code=status_code, detail=safe_detail) from None
     except Exception as exc:
         if isinstance(exc, ValueError) and str(exc).startswith("Only English"):
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        logger.error("Unexpected Hindi translation failure (%s)", type(exc).__name__)
         raise HTTPException(
             status_code=500,
-            detail="Translation failed. Check HF_TOKEN and model access, then try again.",
-        ) from exc
+            detail="An unexpected server error prevented translation.",
+        ) from None
 
     return {
         "job_id": job_id,
