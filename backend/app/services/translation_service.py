@@ -202,6 +202,8 @@ def _build_batch_prompt(segments: list[dict[str, Any]]) -> str:
         "Rules:\n"
         "- Translate meaning faithfully; do not summarize, explain, add, or omit information.\n"
         "- Preserve names, numbers, abbreviations, technical terms, proper nouns, tone, and educational context.\n"
+        "- In computer science and engineering contexts, preserve these technical terms exactly in English, including capitalization: stack, memory, queue, array, pointer, class, object, heap, function, variable, compiler, data structure, API, CPU, RAM. Never translate or transliterate these terms; translate the surrounding natural-language text into Hindi.\n"
+        "- Example: 'Stack is a linear data structure' -> 'Stack एक linear data structure है'.\n"
         "- Prefer natural spoken Hindi suitable for voice dubbing.\n"
         "- Return ONLY a JSON array of objects with exactly the input id and translated_text fields.\n"
         "- Return one object for every input id, exactly once; do not reorder IDs.\n"
@@ -249,6 +251,7 @@ def _raise_request_error(exc: Exception) -> None:
 def _translate_batch(
     segments: list[dict[str, Any]],
     target_language: str,
+    retry_missing: bool = True,
 ) -> dict[int, str]:
     if target_language not in LANGUAGE_NAMES:
         raise ValueError(f"Unsupported target language: {target_language}")
@@ -334,9 +337,21 @@ def _translate_batch(
 
     if translations.keys() != expected_ids:
         missing_ids = expected_ids - translations.keys()
-        raise GeminiResponseError(
-            f"Gemini omitted translations for {len(missing_ids)} segment(s)."
-        )
+        if retry_missing:
+            missing_segments = [
+                segment for segment in segments if segment["id"] in missing_ids
+            ]
+            translations.update(
+                _translate_batch(
+                    missing_segments,
+                    target_language,
+                    retry_missing=False,
+                )
+            )
+        else:
+            raise GeminiResponseError(
+                f"Gemini omitted translations for {len(missing_ids)} segment(s)."
+            )
     return translations
 
 

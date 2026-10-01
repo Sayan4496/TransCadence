@@ -188,6 +188,21 @@ def test_successful_mocked_hindi_translation(
     assert calls[0]["config"].response_mime_type == "application/json"
 
 
+def test_batch_prompt_preserves_common_technical_terms() -> None:
+    prompt = translation_service._build_batch_prompt(
+        [{"id": 1, "text": "Stack is a linear data structure"}]
+    )
+
+    assert "preserve these technical terms exactly in English" in prompt
+    for term in (
+        "stack", "memory", "queue", "array", "pointer", "class", "object",
+        "heap", "function", "variable", "compiler", "data structure", "API",
+        "CPU", "RAM",
+    ):
+        assert term in prompt
+    assert "Stack एक linear data structure है" in prompt
+
+
 def test_transient_unavailable_error_retries(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -412,7 +427,6 @@ def test_thirteen_segments_use_two_gemini_requests(
 @pytest.mark.parametrize(
     "response_items",
     [
-        [{"id": 1, "translated_text": "एक"}],
         [
             {"id": 1, "translated_text": "एक"},
             {"id": 1, "translated_text": "दो"},
@@ -428,7 +442,7 @@ def test_thirteen_segments_use_two_gemini_requests(
         ],
     ],
 )
-def test_incomplete_duplicate_unexpected_or_empty_batch_response_is_rejected(
+def test_duplicate_unexpected_or_empty_batch_response_is_rejected(
     response_items: list[dict[str, object]],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -437,6 +451,49 @@ def test_incomplete_duplicate_unexpected_or_empty_batch_response_is_rejected(
 
     with pytest.raises(translation_service.GeminiResponseError):
         translation_service.translate_segments(segments, "hi")
+
+
+def test_missing_batch_translation_is_retried_for_only_missing_segments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[list[dict[str, object]]] = []
+
+    def generate_content(**kwargs: object) -> object:
+        payload = json.loads(kwargs["contents"].split("English segments JSON:\n", 1)[1])
+        requests.append(payload)
+        if len(requests) == 1:
+            return _batch_response([{"id": 1, "translated_text": "एक"}])
+        return _batch_response([{"id": 2, "translated_text": "दो"}])
+
+    _mock_client(monkeypatch, generate_content)
+    result = translation_service.translate_segments(
+        [{"id": 1, "text": "one"}, {"id": 2, "text": "two"}],
+        "hi",
+    )
+
+    assert [item["translated_text"] for item in result] == ["एक", "दो"]
+    assert [[segment["id"] for segment in request] for request in requests] == [
+        [1, 2],
+        [2],
+    ]
+
+
+def test_repeated_missing_batch_translation_fails_after_one_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests = 0
+
+    def generate_content(**_: object) -> object:
+        nonlocal requests
+        requests += 1
+        return _batch_response([])
+
+    _mock_client(monkeypatch, generate_content)
+
+    with pytest.raises(translation_service.GeminiResponseError, match="omitted"):
+        translation_service.translate_segments([{"id": 1, "text": "one"}], "hi")
+
+    assert requests == 2
 
 
 def test_malformed_batch_json_is_rejected(

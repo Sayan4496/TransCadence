@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import math
+import logging
 import os
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -13,6 +15,20 @@ from backend.app.services.video_service import get_video_metadata
 
 STORAGE_ROOT = Path("storage").resolve()
 OUTPUT_ROOT = (STORAGE_ROOT / "outputs").resolve()
+logger = logging.getLogger(__name__)
+
+
+def _redact_diagnostic(value: str) -> str:
+    api_key = os.getenv("GEMINI_API_KEY")
+    if api_key:
+        value = value.replace(api_key, "[REDACTED]")
+    return value[-8000:]
+
+
+def _stderr_text(value: str | bytes | None) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value or ""
 
 
 def _validate_job_id(job_id: str) -> str:
@@ -68,7 +84,27 @@ def _subtitle_filter_expression(srt_path: Path) -> str:
     if "'" in filter_path or "\n" in filter_path or "\r" in filter_path:
         raise ValueError("Subtitle path contains unsupported filter characters")
     filter_path = filter_path.replace(":", "\\:")
-    return f"subtitles='{filter_path}'"
+    font_directory = Path(
+        os.getenv(
+            "TRANSCADENCE_FONT_DIR",
+            str(Path(__file__).resolve().parents[2] / "fonts" / "libass"),
+        )
+    ).expanduser()
+    if not font_directory.is_absolute():
+        font_directory = Path(__file__).resolve().parents[3] / font_directory
+    try:
+        font_path = Path(
+            os.path.relpath(font_directory.resolve(), Path.cwd())
+        ).as_posix()
+    except ValueError:
+        font_path = font_directory.resolve().as_posix()
+    if "'" in font_path or "\n" in font_path or "\r" in font_path:
+        raise ValueError("Font directory contains unsupported filter characters")
+    font_path = font_path.replace(":", "\\:")
+    return (
+        f"subtitles='{filter_path}':fontsdir='{font_path}':"
+        "force_style='FontName=Noto Sans Devanagari'"
+    )
 
 
 def _get_output_path(job_id: str) -> tuple[Path, Path]:
@@ -100,10 +136,28 @@ def _measure_video_duration(video_path: Path) -> float:
         metadata = get_video_metadata(video_path)
         duration = float(metadata.get("format", {}).get("duration", 0))
     except Exception:
+        logger.exception("FFprobe could not inspect generated video")
         raise RuntimeError("Could not measure generated video duration") from None
 
     if not math.isfinite(duration) or duration <= 0:
         raise RuntimeError("Could not measure generated video duration")
+
+    streams = metadata.get("streams", [])
+    video_streams = [stream for stream in streams if stream.get("codec_type") == "video"]
+    audio_streams = [stream for stream in streams if stream.get("codec_type") == "audio"]
+    if (
+        len(video_streams) != 1
+        or len(audio_streams) != 1
+        or audio_streams[0].get("codec_name") != "aac"
+    ):
+        logger.error(
+            "Generated MP4 failed stream validation: video_streams=%d "
+            "audio_streams=%d audio_codecs=%s",
+            len(video_streams),
+            len(audio_streams),
+            [stream.get("codec_name") for stream in audio_streams],
+        )
+        raise RuntimeError("Generated video does not contain the expected streams")
 
     return duration
 
@@ -191,12 +245,33 @@ def generate_dubbed_video(
                 timeout=120,
                 shell=False,
             )
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as exc:
+            command_text = _redact_diagnostic(shlex.join(command))
+            stderr = _redact_diagnostic(_stderr_text(exc.stderr))
+            logger.exception(
+                "FFmpeg video generation timed out after 120 seconds: "
+                "command=%s stderr=%s",
+                command_text,
+                stderr,
+            )
             raise RuntimeError("Final video generation timed out") from None
+        except OSError:
+            logger.exception(
+                "FFmpeg could not execute command=%s",
+                _redact_diagnostic(shlex.join(command)),
+            )
+            raise RuntimeError("FFmpeg could not be executed") from None
 
         if result.returncode != 0:
+            logger.error(
+                "FFmpeg video generation failed: return_code=%d command=%s stderr=%s",
+                result.returncode,
+                _redact_diagnostic(shlex.join(command)),
+                _redact_diagnostic(_stderr_text(result.stderr)),
+            )
             raise RuntimeError("Final video generation failed")
         if not temporary_output.is_file() or temporary_output.stat().st_size == 0:
+            logger.error("FFmpeg reported success without producing a non-empty MP4")
             raise RuntimeError("FFmpeg produced an invalid output file")
 
         duration = _measure_video_duration(temporary_output)

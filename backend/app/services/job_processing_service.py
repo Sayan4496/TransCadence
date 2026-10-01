@@ -8,6 +8,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import threading
 from typing import Any
 from uuid import UUID
 
@@ -35,6 +36,8 @@ BACKGROUND_VOLUME = 0.25
 FFMPEG_TIMEOUT_SECONDS = 120
 SPEECH_PAUSE_SPLIT_SECONDS = 0.65
 logger = logging.getLogger(__name__)
+_ACTIVE_JOB_IDS: set[str] = set()
+_ACTIVE_JOB_IDS_LOCK = threading.Lock()
 
 
 class JobProcessingError(RuntimeError):
@@ -481,11 +484,65 @@ def _compose_speech_timeline(
     return output_path
 
 
+def _active_job_status(job_id: str) -> dict[str, Any]:
+    try:
+        status = get_job_status(job_id)
+    except FileNotFoundError:
+        status = {
+            "job_id": job_id,
+            "language": "hi",
+            "output_ready": False,
+            "download_url": None,
+        }
+    if status.get("status") == "completed" and status.get("output_ready"):
+        return status
+    return {
+        **status,
+        "status": "processing",
+        "output_ready": False,
+        "download_url": None,
+    }
+
+
 def process_job(job_id: str) -> dict[str, Any]:
+    safe_job_id = validate_job_id(job_id)
+    output_path = OUTPUT_DIR / safe_job_id / "hindi_dubbed.mp4"
+
+    with _ACTIVE_JOB_IDS_LOCK:
+        if safe_job_id in _ACTIVE_JOB_IDS:
+            logger.info("Job %s is already processing; returning current status", safe_job_id)
+            return _active_job_status(safe_job_id)
+
+        status_path = _status_path(safe_job_id)
+        current_status = (
+            get_job_status(safe_job_id)
+            if status_path.is_file()
+            else {}
+        )
+        if (
+            current_status.get("status") == "completed"
+            and current_status.get("output_ready")
+            and output_path.is_file()
+        ):
+            logger.info("Job %s is already completed; reusing final output", safe_job_id)
+            return current_status
+
+        _ACTIVE_JOB_IDS.add(safe_job_id)
+
+    try:
+        _write_status(safe_job_id, "processing", 1, stage="starting")
+        logger.info("Job %s processing started", safe_job_id)
+        return _process_job(safe_job_id)
+    finally:
+        with _ACTIVE_JOB_IDS_LOCK:
+            _ACTIVE_JOB_IDS.discard(safe_job_id)
+
+
+def _process_job(job_id: str) -> dict[str, Any]:
     safe_job_id = validate_job_id(job_id)
     sync_results: list[dict[str, int | float | str | bool]] = []
     current_stage = "validation"
-    _write_status(safe_job_id, "uploaded", 1, stage=current_stage)
+    _write_status(safe_job_id, "processing", 1, stage=current_stage)
 
     try:
         video_path = _find_video(safe_job_id)
@@ -809,7 +866,7 @@ def process_job(job_id: str) -> dict[str, Any]:
             error=exc.message,
             sync_results=sync_results,
         )
-        logger.error("Job %s failed at %s", safe_job_id, exc.stage)
+        logger.exception("Job %s failed at %s", safe_job_id, exc.stage)
         raise
     except Exception as exc:
         _write_status(
@@ -820,11 +877,10 @@ def process_job(job_id: str) -> dict[str, Any]:
             error=f"Processing failed during {current_stage}.",
             sync_results=sync_results,
         )
-        logger.error(
-            "Job %s failed at %s (%s)",
+        logger.exception(
+            "Job %s failed at %s",
             safe_job_id,
             current_stage,
-            type(exc).__name__,
         )
         raise JobProcessingError(
             current_stage,

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { NavLink, Route, Routes, useNavigate } from 'react-router-dom';
 import {
@@ -144,6 +144,7 @@ function TranslatePage({ job, videoUrl, updateJob }: { job?: SavedJob; videoUrl?
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState('');
   const [status, setStatus] = useState<JobStatus>();
+  const processingRef = useRef(false);
   const navigate = useNavigate();
   useEffect(() => {
     let cancelled = false;
@@ -157,7 +158,8 @@ function TranslatePage({ job, videoUrl, updateJob }: { job?: SavedJob; videoUrl?
   }, [job?.job_id]);
 
   async function startDubbing() {
-    if (!job || busy) return;
+    if (!job || processingRef.current) return;
+    processingRef.current = true;
     setBusy(true);
     setMessage('');
     let finalStatus: JobStatus | undefined;
@@ -185,6 +187,7 @@ function TranslatePage({ job, videoUrl, updateJob }: { job?: SavedJob; videoUrl?
     } catch (error) {
       setMessage(error instanceof Error ? error.message : 'The request could not be completed. Please try again.');
     } finally {
+      processingRef.current = false;
       setBusy(false);
     }
   }
@@ -201,7 +204,7 @@ function TranslatePage({ job, videoUrl, updateJob }: { job?: SavedJob; videoUrl?
           {completed ? <video key={downloadUrl} controls playsInline preload="metadata" src={downloadUrl} aria-label="Completed Hindi dubbed video" /> : videoUrl ? <video key={videoUrl} controls playsInline preload="metadata" src={videoUrl} aria-label="Uploaded source video" /> : <EmptyState title={job?.filename || 'No video selected'} detail={job ? 'The original upload is available only in the current browser session. You can still process and download the result.' : 'Upload a supported video from Home to begin.'} action={!job && <button className="secondary-button" type="button" onClick={() => navigate('/')}>Go to upload <ArrowRight size={15} /></button>} />}
           {job && <><span className="video-label"><FileVideo2 size={14} />{job.filename}</span><span className="source-label"><Globe2 size={14} />Original: English</span></>}
         </div>
-        {busy && <div className="processing-panel" role="status"><LoaderCircle className="spin" size={19} /><div><strong>Processing your Hindi dub</strong><p>Waiting for the latest backend status.</p></div>{typeof progress === 'number' && <span className="real-progress">{Math.round(progress)}%</span>}<div className="progress-track"><span style={{ width: `${typeof progress === 'number' ? Math.max(0, Math.min(100, progress)) : 15}%` }} /></div></div>}
+        {busy && <div className="processing-panel" role="status"><LoaderCircle className="spin" size={19} /><div><strong>Processing your Hindi dub</strong><p>Waiting for the latest backend status.</p></div>{typeof progress === 'number' && <span className="real-progress">{Math.round(progress)}%</span>}<div className="progress-track"><span style={{ width: `${typeof progress === 'number' ? Math.max(0, Math.min(100, progress)) : 0}%` }} /></div></div>}
         {completed && <div className="result-details"><SyncCard results={status?.sync_validation || job?.sync_validation} /><div className="result-actions"><span className="result-language"><span>🇮🇳</span> Hindi dubbed video</span><a className="primary-button" href={downloadUrl} download><ArrowDownToLine size={16} />Download MP4</a></div></div>}
         {failed && <div className="failure-panel" role="alert"><XCircle size={19} /><div><strong>Processing failed</strong><p>{message || 'The backend reported that this job failed. No completed video is available.'}</p></div></div>}
         {message && !failed && <div className="inline-error" role="alert">{message}</div>}

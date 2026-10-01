@@ -438,6 +438,113 @@ def test_timeline_ffmpeg_failure_logs_only_return_code(
     assert "internal parser details" not in caplog.text
 
 
+def test_video_generation_failure_is_persisted_without_ready_output(
+    job_setup: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def failed_video(*_: object) -> dict[str, object]:
+        raise RuntimeError("Final video generation failed")
+
+    monkeypatch.setattr(processing, "generate_dubbed_video", failed_video)
+
+    with pytest.raises(processing.JobProcessingError) as raised:
+        processing.process_job(str(job_setup["job_id"]))
+
+    assert raised.value.stage == "video_generation"
+    status = processing.get_job_status(str(job_setup["job_id"]))
+    assert status["status"] == "failed"
+    assert status["stage"] == "video_generation"
+    assert status["output_ready"] is False
+    assert "Traceback" in caplog.text
+    assert "Final video generation failed" in caplog.text
+    assert not (
+        Path(job_setup["storage_root"])
+        / "outputs"
+        / str(job_setup["job_id"])
+        / "hindi_dubbed.mp4"
+    ).exists()
+
+
+def test_duplicate_process_calls_are_single_flight(
+    job_setup: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    started = Event()
+    release = Event()
+    calls = 0
+
+    def blocked_process(requested_job_id: str) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        started.set()
+        assert release.wait(timeout=5)
+        return {"job_id": requested_job_id, "status": "completed", "output_ready": True}
+
+    monkeypatch.setattr(processing, "_process_job", blocked_process)
+    job_id = str(job_setup["job_id"])
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(processing.process_job, job_id)
+        assert started.wait(timeout=2)
+        second = executor.submit(processing.process_job, job_id)
+        try:
+            duplicate_result = second.result(timeout=2)
+            assert processing.get_job_status(job_id)["status"] == "processing"
+        finally:
+            release.set()
+        first_result = first.result(timeout=2)
+
+    assert calls == 1
+    assert duplicate_result["status"] == "processing"
+    assert first_result["status"] == "completed"
+
+
+def test_completed_process_reuses_output_without_regeneration(
+    job_setup: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job_id = str(job_setup["job_id"])
+    output_path = Path(job_setup["storage_root"]) / "outputs" / job_id / "hindi_dubbed.mp4"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_bytes(b"valid-final-video")
+    processing._write_status(job_id, "completed", 100, output_ready=True)
+
+    def unexpected_process(_: str) -> dict[str, object]:
+        raise AssertionError("Completed output must not be regenerated")
+
+    monkeypatch.setattr(processing, "_process_job", unexpected_process)
+
+    result = processing.process_job(job_id)
+
+    assert result["status"] == "completed"
+    assert result["output_ready"] is True
+    assert output_path.read_bytes() == b"valid-final-video"
+
+
+def test_failed_process_can_be_retried(
+    job_setup: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job_id = str(job_setup["job_id"])
+    processing._write_status(job_id, "failed", 0, stage="video_generation", error="failed")
+    calls = 0
+
+    def retry_process(requested_job_id: str) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        return {"job_id": requested_job_id, "status": "completed", "output_ready": True}
+
+    monkeypatch.setattr(processing, "_process_job", retry_process)
+
+    result = processing.process_job(job_id)
+
+    assert calls == 1
+    assert result["status"] == "completed"
+
+
 def test_process_download_and_status_routes_are_job_scoped(
     job_setup: dict[str, object],
     monkeypatch: pytest.MonkeyPatch,

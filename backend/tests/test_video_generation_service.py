@@ -57,7 +57,13 @@ def _mock_successful_ffmpeg(
     def fake_metadata(path: Path) -> dict[str, object]:
         assert path.is_file()
         assert path.suffix == ".mp4"
-        return {"format": {"duration": metadata_duration}}
+        return {
+            "format": {"duration": metadata_duration},
+            "streams": [
+                {"codec_type": "video", "codec_name": "h264"},
+                {"codec_type": "audio", "codec_name": "aac"},
+            ],
+        }
 
     monkeypatch.setattr(service.subprocess, "run", fake_run)
     monkeypatch.setattr(service, "get_video_metadata", fake_metadata)
@@ -130,11 +136,15 @@ def test_ffmpeg_command_maps_inputs_and_burns_subtitles(
     assert command[command.index("-movflags") + 1] == "+faststart"
 
 
-def test_subtitle_filter_escapes_windows_path_characters() -> None:
+def test_subtitle_filter_escapes_windows_path_characters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     windows_path = PureWindowsPath(r"C:\Users\A Name\subs.srt")
+    monkeypatch.setenv("TRANSCADENCE_FONT_DIR", "custom fonts")
 
     assert service._subtitle_filter_expression(windows_path) == (
-        r"subtitles='C\:/Users/A Name/subs.srt'"
+        r"subtitles='C\:/Users/A Name/subs.srt':fontsdir='custom fonts':"
+        "force_style='FontName=Noto Sans Devanagari'"
     )
 
 
@@ -219,6 +229,7 @@ def test_ffmpeg_failure_is_safe_and_removes_temporary_output(
     failure: str,
     storage_tree: tuple[Path, Path, Path, Path],
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     storage_root, video_path, audio_path, srt_path = storage_tree
 
@@ -229,10 +240,11 @@ def test_ffmpeg_failure_is_safe_and_removes_temporary_output(
         return type(
             "Completed",
             (),
-            {"returncode": 1, "stderr": "arbitrary ffmpeg details"},
+            {"returncode": 1, "stderr": "decode failure with test-api-secret"},
         )()
 
     monkeypatch.setattr(service.subprocess, "run", fake_run)
+    monkeypatch.setenv("GEMINI_API_KEY", "test-api-secret")
     monkeypatch.setattr(
         service,
         "get_video_metadata",
@@ -243,7 +255,14 @@ def test_ffmpeg_failure_is_safe_and_removes_temporary_output(
     with pytest.raises(RuntimeError) as error:
         generate_dubbed_video(job_id, video_path, audio_path, srt_path)
 
-    assert "arbitrary ffmpeg details" not in str(error.value)
+    assert "decode failure with" not in str(error.value)
+    assert "test-api-secret" not in caplog.text
+    assert "ffmpeg-test.exe" in caplog.text
+    if failure == "timeout":
+        assert "timed out after 120 seconds" in caplog.text
+    else:
+        assert "return_code=1" in caplog.text
+        assert "decode failure" in caplog.text
     output_directory = storage_root / "outputs" / job_id
     assert list(output_directory.iterdir()) == []
 

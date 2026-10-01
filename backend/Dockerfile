@@ -15,6 +15,7 @@ RUN python -m pip install --no-cache-dir -r /app/backend/requirements.txt \
     && python -m pip check
 
 COPY backend/app /app/backend/app
+COPY backend/fonts /app/backend/fonts
 
 RUN mkdir -p /app/storage/uploads /app/storage/audio \
     /app/storage/transcripts /app/storage/subtitles /app/storage/outputs \
