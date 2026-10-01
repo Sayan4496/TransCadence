@@ -29,6 +29,10 @@ def _gemini_response(
     )
 
 
+def _batch_response(translations: list[dict[str, object]]) -> object:
+    return _gemini_response(json.dumps(translations, ensure_ascii=False))
+
+
 def _api_error(code: int, status: str, message: str = "") -> errors.APIError:
     return errors.APIError(
         code,
@@ -169,7 +173,7 @@ def test_successful_mocked_hindi_translation(
 
     def generate_content(**kwargs: object) -> object:
         calls.append(kwargs)
-        return _gemini_response("नमस्ते सभी को।")
+        return _batch_response([{"id": 1, "translated_text": "नमस्ते सभी को।"}])
 
     _mock_client(monkeypatch, generate_content)
     result = translation_service.translate_text("Hello everyone.", "hi")
@@ -180,7 +184,8 @@ def test_successful_mocked_hindi_translation(
     assert calls[0]["contents"].startswith(
         "You are a professional English-to-Hindi translator"
     )
-    assert "Return ONLY the Hindi translation" in calls[0]["contents"]
+    assert "Return ONLY a JSON array" in calls[0]["contents"]
+    assert calls[0]["config"].response_mime_type == "application/json"
 
 
 def test_transient_unavailable_error_retries(
@@ -193,7 +198,9 @@ def test_transient_unavailable_error_retries(
         calls += 1
         if calls == 1:
             raise _api_error(503, "UNAVAILABLE", "temporary")
-        return _gemini_response("निरंतरता सफलता की कुंजी है।")
+        return _batch_response(
+            [{"id": 1, "translated_text": "निरंतरता सफलता की कुंजी है।"}]
+        )
 
     _mock_client(monkeypatch, generate_content)
     monkeypatch.setattr(translation_service.time, "sleep", lambda _: None)
@@ -287,9 +294,12 @@ def test_empty_or_missing_gemini_response_is_rejected(
 @pytest.mark.parametrize(
     ("response", "message"),
     [
-        (_gemini_response("नमस्ते", types.FinishReason.MAX_TOKENS), "truncated"),
-        (_gemini_response("नमस्ते", types.FinishReason.SAFETY), "invalid or blocked"),
-        (_gemini_response("Hello everyone."), "not Hindi in Devanagari"),
+        (_gemini_response("[]", types.FinishReason.MAX_TOKENS), "truncated"),
+        (_gemini_response("[]", types.FinishReason.SAFETY), "invalid or blocked"),
+        (
+            _batch_response([{"id": 1, "translated_text": "Hello everyone."}]),
+            "not Hindi in Devanagari",
+        ),
     ],
 )
 def test_truncated_invalid_or_non_hindi_response_is_rejected(
@@ -302,14 +312,17 @@ def test_truncated_invalid_or_non_hindi_response_is_rejected(
     with pytest.raises(translation_service.GeminiResponseError, match=message):
         translation_service.translate_text("Hello.", "hi")
 
-
 def test_multiple_segments_preserve_source_fields(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    translations = iter(["नमस्ते।", "आज आपका स्वागत है।"])
     _mock_client(
         monkeypatch,
-        lambda **_: _gemini_response(next(translations)),
+        lambda **_: _batch_response(
+            [
+                {"id": 1, "translated_text": "नमस्ते।"},
+                {"id": 2, "translated_text": "आज आपका स्वागत है।"},
+            ]
+        ),
     )
     segments = [
         {"id": 1, "start": 1.25, "end": 2.5, "duration": 1.25, "text": "Hello."},
@@ -327,6 +340,126 @@ def test_multiple_segments_preserve_source_fields(
         "नमस्ते।",
         "आज आपका स्वागत है।",
     ]
+
+
+def test_one_gemini_request_translates_one_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[list[dict[str, object]]] = []
+
+    def generate_content(**kwargs: object) -> object:
+        payload = json.loads(kwargs["contents"].split("English segments JSON:\n", 1)[1])
+        requests.append(payload)
+        return _batch_response(
+            [{"id": segment["id"], "translated_text": f"हिंदी {segment['id']}"} for segment in payload]
+        )
+
+    _mock_client(monkeypatch, generate_content)
+    segments = [{"id": index, "start": index, "end": index + 1, "text": f"text {index}"} for index in range(1, 4)]
+
+    translated = translation_service.translate_segments(segments, "hi")
+
+    assert len(requests) == 1
+    assert len(requests[0]) == 3
+    assert len(translated) == 3
+
+
+def test_large_transcript_uses_multiple_batches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GEMINI_TRANSLATION_BATCH_SIZE", "2")
+    requests: list[list[dict[str, object]]] = []
+
+    def generate_content(**kwargs: object) -> object:
+        payload = json.loads(kwargs["contents"].split("English segments JSON:\n", 1)[1])
+        requests.append(payload)
+        return _batch_response(
+            [{"id": segment["id"], "translated_text": f"हिंदी {segment['id']}"} for segment in payload]
+        )
+
+    _mock_client(monkeypatch, generate_content)
+    segments = [{"id": index, "start": index, "end": index + 1, "text": f"text {index}"} for index in range(1, 6)]
+
+    translated = translation_service.translate_segments(segments, "hi")
+
+    assert [len(batch) for batch in requests] == [2, 2, 1]
+    assert [segment["id"] for segment in translated] == [1, 2, 3, 4, 5]
+
+
+def test_thirteen_segments_use_two_gemini_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GEMINI_TRANSLATION_BATCH_SIZE", "8")
+    requests: list[list[dict[str, object]]] = []
+
+    def generate_content(**kwargs: object) -> object:
+        payload = json.loads(kwargs["contents"].split("English segments JSON:\n", 1)[1])
+        requests.append(payload)
+        return _batch_response(
+            [{"id": segment["id"], "translated_text": f"हिंदी {segment['id']}"} for segment in payload]
+        )
+
+    _mock_client(monkeypatch, generate_content)
+    segments = [{"id": index, "start": index, "end": index + 1, "text": f"text {index}"} for index in range(1, 14)]
+
+    result = translation_service.translate_segments(segments, "hi")
+
+    assert [len(batch) for batch in requests] == [8, 5]
+    assert len(requests) == 2
+    assert len(result) == 13
+
+
+@pytest.mark.parametrize(
+    "response_items",
+    [
+        [{"id": 1, "translated_text": "एक"}],
+        [
+            {"id": 1, "translated_text": "एक"},
+            {"id": 1, "translated_text": "दो"},
+        ],
+        [
+            {"id": 1, "translated_text": "एक"},
+            {"id": 2, "translated_text": "दो"},
+            {"id": 99, "translated_text": "गलत"},
+        ],
+        [
+            {"id": 1, "translated_text": "एक"},
+            {"id": 2, "translated_text": "   "},
+        ],
+    ],
+)
+def test_incomplete_duplicate_unexpected_or_empty_batch_response_is_rejected(
+    response_items: list[dict[str, object]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mock_client(monkeypatch, lambda **_: _batch_response(response_items))
+    segments = [{"id": 1, "text": "one"}, {"id": 2, "text": "two"}]
+
+    with pytest.raises(translation_service.GeminiResponseError):
+        translation_service.translate_segments(segments, "hi")
+
+
+def test_malformed_batch_json_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mock_client(monkeypatch, lambda **_: _gemini_response("not JSON"))
+
+    with pytest.raises(translation_service.GeminiResponseError, match="malformed"):
+        translation_service.translate_segments([{"id": 1, "text": "Hello"}], "hi")
+
+
+@pytest.mark.parametrize(
+    "segments",
+    [
+        [{"text": "Missing ID"}],
+        [{"id": 1, "text": "one"}, {"id": 1, "text": "duplicate"}],
+    ],
+)
+def test_missing_or_duplicate_input_ids_are_rejected(
+    segments: list[dict[str, object]],
+) -> None:
+    with pytest.raises(ValueError):
+        translation_service.translate_segments(segments, "hi")
 
 
 @pytest.mark.parametrize(

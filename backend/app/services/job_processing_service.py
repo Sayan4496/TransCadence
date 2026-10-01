@@ -413,11 +413,15 @@ def _compose_speech_timeline(
         labels.append(f"[{label}]")
 
     if len(labels) == 1:
-        filter_parts.append(f"{labels[0]}anull[mix]")
+        filter_parts.append(f"{labels[0]}anull[timeline_raw]")
     else:
         filter_parts.append(
-            f"{''.join(labels)}amix=inputs={len(labels)}:duration=longest:dropout_transition=0[mix]"
+            f"{''.join(labels)}amix=inputs={len(labels)}:duration=longest:dropout_transition=0[timeline_raw]"
         )
+    filter_parts.append(
+        f"[timeline_raw]apad=whole_dur={target_duration_seconds:.3f},"
+        f"atrim=duration={target_duration_seconds:.3f}[mix]"
+    )
 
     command.extend(
         [
@@ -425,8 +429,6 @@ def _compose_speech_timeline(
             ";".join(filter_parts),
             "-map",
             "[mix]",
-            "-af",
-            f"apad=whole_dur={target_duration_seconds:.3f}",
             "-t",
             f"{target_duration_seconds:.3f}",
             "-ac",
@@ -461,8 +463,16 @@ def _compose_speech_timeline(
                 check=False,
             )
         except subprocess.TimeoutExpired:
+            logger.error("Speech timeline FFmpeg timed out")
             raise JobProcessingError("audio_adjustment", "Speech timeline composition timed out.") from None
-        if result.returncode != 0 or not temporary_path.is_file() or temporary_path.stat().st_size == 0:
+        if result.returncode != 0:
+            logger.error(
+                "Speech timeline FFmpeg failed (return_code=%d)",
+                result.returncode,
+            )
+            raise JobProcessingError("audio_adjustment", "Speech timeline composition failed.")
+        if not temporary_path.is_file() or temporary_path.stat().st_size == 0:
+            logger.error("Speech timeline FFmpeg did not produce a non-empty output file")
             raise JobProcessingError("audio_adjustment", "Speech timeline composition failed.")
         os.replace(temporary_path, output_path)
     finally:
@@ -553,6 +563,9 @@ def process_job(job_id: str) -> dict[str, Any]:
         chunk_count = len(translated_chunks)
         for index, chunk in enumerate(translated_chunks, start=1):
             current_stage = "tts"
+            generated_duration_for_log: float | None = None
+            adjustment_factor_for_log: float | None = None
+            adjustment_attempted = False
             _write_status(
                 safe_job_id,
                 "generating_tts",
@@ -569,9 +582,26 @@ def process_job(job_id: str) -> dict[str, Any]:
                 )
                 tts_path = _contained_file(tts_path, "generated Hindi speech")
                 generated_duration = get_audio_duration(tts_path)
+                generated_duration_for_log = generated_duration
 
                 current_stage = "audio_adjustment"
                 cadence = calculate_cadence(target_duration, generated_duration)
+                adjustment_factor_for_log = cadence.speed_factor
+                logger.info(
+                    "speech window timing window_id=%d start=%.3f end=%.3f "
+                    "target_duration=%.3f generated_tts_duration=%.3f",
+                    int(chunk["id"]),
+                    float(chunk["start"]),
+                    float(chunk["end"]),
+                    target_duration,
+                    generated_duration,
+                )
+                logger.info(
+                    "speech window adjustment window_id=%d factor=%.6f attempted=true",
+                    int(chunk["id"]),
+                    cadence.speed_factor,
+                )
+                adjustment_attempted = True
                 adjusted = adjust_audio_duration(
                     tts_path,
                     safe_job_id,
@@ -580,6 +610,16 @@ def process_job(job_id: str) -> dict[str, Any]:
                 )
                 adjusted_path = _contained_file(adjusted.output_path, "adjusted Hindi speech")
                 measured_adjusted_duration = get_audio_duration(adjusted_path)
+                logger.info(
+                    "speech window result window_id=%d actual_duration=%.3f "
+                    "sync_error_ms=%.3f status=%s",
+                    int(chunk["id"]),
+                    measured_adjusted_duration,
+                    (measured_adjusted_duration - target_duration) * 1000,
+                    "PASS"
+                    if abs(measured_adjusted_duration - target_duration) <= 0.2
+                    else "FAIL",
+                )
                 sync_result = validate_sync(
                     safe_job_id,
                     segment_id,
@@ -589,6 +629,22 @@ def process_job(job_id: str) -> dict[str, Any]:
             except JobProcessingError:
                 raise
             except Exception:
+                logger.warning(
+                    "speech window failed window_id=%s start=%.3f end=%.3f "
+                    "target_duration=%.3f generated_tts_duration=%s "
+                    "adjustment_factor=%s attempted=%s",
+                    chunk.get("id", index),
+                    float(chunk.get("start", 0.0)),
+                    float(chunk.get("end", 0.0)),
+                    max(0.0, float(chunk.get("end", 0.0)) - float(chunk.get("start", 0.0))),
+                    f"{generated_duration_for_log:.3f}"
+                    if generated_duration_for_log is not None
+                    else "unavailable",
+                    f"{adjustment_factor_for_log:.6f}"
+                    if adjustment_factor_for_log is not None
+                    else "unavailable",
+                    adjustment_attempted,
+                )
                 raise JobProcessingError(
                     current_stage,
                     f"Hindi audio processing failed for segment {index}.",

@@ -123,9 +123,13 @@ def job_setup(
         assert kwargs["timeout"] == processing.FFMPEG_TIMEOUT_SECONDS
         output_path = Path(command[-1])
         output_path.write_bytes(b"hindi-only-timeline")
-        pad_argument = command[command.index("-af") + 1]
+        filter_graph = command[command.index("-filter_complex") + 1]
+        pad_filter = next(
+            part for part in filter_graph.split(";") if "apad=whole_dur=" in part
+        )
         final_timeline_path = output_path.parent / "hindi_speech.wav"
-        durations[final_timeline_path.resolve()] = float(pad_argument.split("=")[-1])
+        padded_duration = pad_filter.split("apad=whole_dur=", 1)[1].split(",", 1)[0]
+        durations[final_timeline_path.resolve()] = float(padded_duration)
         return SimpleNamespace(returncode=0, stderr="")
 
     monkeypatch.setattr(processing.subprocess, "run", fake_ffmpeg)
@@ -343,7 +347,8 @@ def test_full_pipeline_uses_hindi_only_audio_and_preserves_source_gaps(
         timeline_command.index("-filter_complex") + 1
     ]
     assert "adelay=delays=1700:all=1" in timeline_filter
-    assert "apad=whole_dur=5.000" in timeline_command
+    assert "apad=whole_dur=5.000" in timeline_filter
+    assert "-af" not in timeline_command
     assert str(job_setup["audio_path"].resolve()) not in timeline_command
 
     final_audio = job_setup["final_video_audio_inputs"]
@@ -409,6 +414,28 @@ def test_out_of_tolerance_speech_chunk_stops_before_video_generation(
     assert TestClient(app).get(
         f"/api/jobs/{job_setup['job_id']}/download"
     ).status_code == 404
+
+
+def test_timeline_ffmpeg_failure_logs_only_return_code(
+    job_setup: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def failed_ffmpeg(command: list[str], **kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(
+            returncode=-22,
+            stderr="provider secret and internal parser details",
+        )
+
+    monkeypatch.setattr(processing.subprocess, "run", failed_ffmpeg)
+
+    with pytest.raises(processing.JobProcessingError) as raised:
+        processing.process_job(str(job_setup["job_id"]))
+
+    assert raised.value.stage == "audio_adjustment"
+    assert "return_code=-22" in caplog.text
+    assert "provider secret" not in caplog.text
+    assert "internal parser details" not in caplog.text
 
 
 def test_process_download_and_status_routes_are_job_scoped(

@@ -1,6 +1,7 @@
 """Server-side English-to-Hindi translation through the Gemini API."""
 
 import os
+import json
 import time
 from typing import Any
 
@@ -16,6 +17,8 @@ load_backend_environment()
 
 MODEL_ID = "gemini-3.1-flash-lite"
 TRANSIENT_RETRY_LIMIT = 3
+DEFAULT_TRANSLATION_BATCH_SIZE = 8
+MAX_TRANSLATION_BATCH_SIZE = 32
 FREE_FLASH_MODELS = (
     "gemini-3.1-flash-lite",
     "gemini-3.8-flash",
@@ -158,6 +161,56 @@ def _translate_prompt(text: str) -> str:
     )
 
 
+def _translation_response_schema() -> types.Schema:
+    return types.Schema(
+        type=types.Type.ARRAY,
+        items=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "id": types.Schema(type=types.Type.INTEGER),
+                "translated_text": types.Schema(type=types.Type.STRING),
+            },
+            required=["id", "translated_text"],
+        ),
+    )
+
+
+def _get_batch_size() -> int:
+    raw_batch_size = os.getenv(
+        "GEMINI_TRANSLATION_BATCH_SIZE",
+        str(DEFAULT_TRANSLATION_BATCH_SIZE),
+    )
+    try:
+        batch_size = int(raw_batch_size)
+    except ValueError:
+        raise ValueError("GEMINI_TRANSLATION_BATCH_SIZE must be an integer.") from None
+    if not 1 <= batch_size <= MAX_TRANSLATION_BATCH_SIZE:
+        raise ValueError(
+            f"GEMINI_TRANSLATION_BATCH_SIZE must be between 1 and {MAX_TRANSLATION_BATCH_SIZE}."
+        )
+    return batch_size
+
+
+def _build_batch_prompt(segments: list[dict[str, Any]]) -> str:
+    segment_payload = [
+        {"id": segment["id"], "text": segment["text"]}
+        for segment in segments
+    ]
+    return (
+        "You are a professional English-to-Hindi translator for educational video dubbing.\n\n"
+        "Translate every supplied English segment into natural, fluent Hindi written in Devanagari.\n\n"
+        "Rules:\n"
+        "- Translate meaning faithfully; do not summarize, explain, add, or omit information.\n"
+        "- Preserve names, numbers, abbreviations, technical terms, proper nouns, tone, and educational context.\n"
+        "- Prefer natural spoken Hindi suitable for voice dubbing.\n"
+        "- Return ONLY a JSON array of objects with exactly the input id and translated_text fields.\n"
+        "- Return one object for every input id, exactly once; do not reorder IDs.\n"
+        "- Every translated_text must be Hindi in Devanagari, with no English explanation.\n"
+        "- Do not transliterate Hindi into Latin characters.\n\n"
+        f"English segments JSON:\n{json.dumps(segment_payload, ensure_ascii=False)}"
+    )
+
+
 def _raise_api_error(exc: errors.APIError) -> None:
     status_code = getattr(exc, "code", None)
     error_status = str(getattr(exc, "status", "")).upper()
@@ -193,12 +246,28 @@ def _raise_request_error(exc: Exception) -> None:
     raise exc
 
 
-def translate_text(text: str, target_language: str) -> str:
-    """Translate one English text segment to natural Devanagari Hindi."""
+def _translate_batch(
+    segments: list[dict[str, Any]],
+    target_language: str,
+) -> dict[int, str]:
     if target_language not in LANGUAGE_NAMES:
         raise ValueError(f"Unsupported target language: {target_language}")
-    if not isinstance(text, str) or not text.strip():
-        raise ValueError("Cannot translate empty text.")
+
+    expected_ids: set[int] = set()
+    for segment in segments:
+        if not isinstance(segment, dict):
+            raise ValueError("Each translation segment must be an object.")
+        segment_id = segment.get("id")
+        if isinstance(segment_id, bool) or not isinstance(segment_id, int):
+            raise ValueError("Every segment must have an integer id.")
+        if segment_id in expected_ids:
+            raise ValueError("Segment IDs must be unique.")
+        expected_ids.add(segment_id)
+        if not isinstance(segment.get("text"), str) or not segment["text"].strip():
+            raise ValueError(f"Segment {segment_id} has empty English text.")
+
+    if not segments:
+        return {}
 
     client = get_translation_client()
     selected_model = resolve_translation_model(client)
@@ -206,10 +275,12 @@ def translate_text(text: str, target_language: str) -> str:
         try:
             response = client.models.generate_content(
                 model=selected_model,
-                contents=_translate_prompt(text.strip()),
+                contents=_build_batch_prompt(segments),
                 config=types.GenerateContentConfig(
                     temperature=0.1,
-                    max_output_tokens=2048,
+                    max_output_tokens=min(8192, 1024 + len(segments) * 512),
+                    response_mime_type="application/json",
+                    response_schema=_translation_response_schema(),
                 ),
             )
             break
@@ -228,40 +299,74 @@ def translate_text(text: str, target_language: str) -> str:
     candidates = getattr(response, "candidates", None)
     if not candidates:
         raise GeminiResponseError("Gemini returned no translation candidates.")
-
-    candidate = candidates[0]
-    finish_reason = getattr(candidate, "finish_reason", None)
+    finish_reason = getattr(candidates[0], "finish_reason", None)
     if finish_reason == types.FinishReason.MAX_TOKENS:
         raise GeminiResponseError("The Gemini translation response was truncated.")
     if finish_reason != types.FinishReason.STOP:
         raise GeminiResponseError("Gemini returned an invalid or blocked response.")
 
     try:
-        translated_text = response.text
-    except (AttributeError, ValueError):
-        raise GeminiResponseError("Gemini returned an invalid translation response.") from None
-    if not isinstance(translated_text, str) or not translated_text.strip():
-        raise GeminiResponseError("Gemini returned an empty translation.")
+        raw_response = response.text
+        translated_items = json.loads(raw_response)
+    except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+        raise GeminiResponseError("Gemini returned malformed translation JSON.") from None
+    if not isinstance(translated_items, list):
+        raise GeminiResponseError("Gemini translation response must be a JSON array.")
 
-    translated_text = translated_text.strip()
-    if not any("\u0900" <= character <= "\u097f" for character in translated_text):
-        raise GeminiResponseError("Gemini response was not Hindi in Devanagari.")
+    translations: dict[int, str] = {}
+    for item in translated_items:
+        if not isinstance(item, dict):
+            raise GeminiResponseError("Gemini returned an invalid translation item.")
+        segment_id = item.get("id")
+        translated_text = item.get("translated_text")
+        if isinstance(segment_id, bool) or not isinstance(segment_id, int):
+            raise GeminiResponseError("Gemini returned an invalid segment ID.")
+        if segment_id not in expected_ids:
+            raise GeminiResponseError("Gemini returned an unexpected segment ID.")
+        if segment_id in translations:
+            raise GeminiResponseError("Gemini returned a duplicate segment ID.")
+        if not isinstance(translated_text, str) or not translated_text.strip():
+            raise GeminiResponseError(f"Gemini returned an empty translation for segment {segment_id}.")
+        normalized_text = translated_text.strip()
+        if not any("\u0900" <= character <= "\u097f" for character in normalized_text):
+            raise GeminiResponseError(f"Gemini response for segment {segment_id} was not Hindi in Devanagari.")
+        translations[segment_id] = normalized_text
 
-    return translated_text
+    if translations.keys() != expected_ids:
+        missing_ids = expected_ids - translations.keys()
+        raise GeminiResponseError(
+            f"Gemini omitted translations for {len(missing_ids)} segment(s)."
+        )
+    return translations
+
+
+def translate_text(text: str, target_language: str) -> str:
+    """Translate one English text using the structured batch interface."""
+    if target_language not in LANGUAGE_NAMES:
+        raise ValueError(f"Unsupported target language: {target_language}")
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("Cannot translate empty text.")
+    return _translate_batch([{"id": 1, "text": text.strip()}], target_language)[1]
 
 
 def translate_segments(
     segments: list[dict[str, Any]],
     target_language: str,
 ) -> list[dict[str, Any]]:
-    """Translate segments independently while retaining original fields."""
+    """Translate segments in configurable structured batches, preserving fields."""
     if target_language not in LANGUAGE_NAMES:
         raise ValueError(f"Unsupported target language: {target_language}")
+    if not isinstance(segments, list):
+        raise ValueError("segments must be provided as a list.")
 
-    return [
-        {
-            **segment,
-            "translated_text": translate_text(segment["text"], target_language),
-        }
-        for segment in segments
-    ]
+    batch_size = _get_batch_size()
+    translated_segments: list[dict[str, Any]] = []
+    for start_index in range(0, len(segments), batch_size):
+        batch = segments[start_index : start_index + batch_size]
+        batch_translations = _translate_batch(batch, target_language)
+        translated_segments.extend(
+            {**segment, "translated_text": batch_translations[segment["id"]]}
+            for segment in batch
+        )
+
+    return translated_segments
