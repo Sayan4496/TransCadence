@@ -24,3 +24,8 @@ storage/outputs/*
 Thumbs.db
 
 storage/subtitles/*
+
+frontend/node_modules/
+frontend/dist/
+
+frontend/tsconfig.tsbuildinfo
