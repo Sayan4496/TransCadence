@@ -1,0 +1,19 @@
+services:
+  backend:
+    container_name: transcadence-backend
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    env_file:
+      - ./backend/.env
+    environment:
+      HF_HOME: /app/model-cache
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./storage:/app/storage
+      - transcadence-model-cache:/app/model-cache
+    restart: unless-stopped
+
+volumes:
+  transcadence-model-cache:

@@ -1,0 +1,12 @@
+.git
+.venv
+**/__pycache__
+*.pyc
+backend/.env
+storage/uploads/*
+storage/audio/*
+storage/transcripts/*
+storage/subtitles/*
+storage/outputs/*
+frontend/node_modules
+frontend/dist

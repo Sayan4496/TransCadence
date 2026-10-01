@@ -17,6 +17,26 @@ From the repository root, install the Google GenAI SDK and dotenv loader into th
 
 Open `http://127.0.0.1:8000/docs` for Swagger.
 
+## Run the backend with Docker
+
+From the repository root, build and start only the backend:
+
+```powershell
+docker compose build backend
+docker compose up -d backend
+docker compose ps
+docker compose logs backend --tail 100
+```
+
+The backend is available at `http://127.0.0.1:8000`, with Swagger at
+`http://127.0.0.1:8000/docs`. Uploads and generated files persist in the root
+`storage` directory, and downloaded speech models persist in a named Docker
+volume. The container reads Gemini settings from `backend/.env`; that file is
+not included in the image.
+
+Keep running the existing React frontend locally, outside Docker. Its Vite
+development proxy sends `/api` requests to `http://127.0.0.1:8000`.
+
 ## API flow
 
 1. Upload a video with `POST /api/upload` (MP4/WebM, up to 120 seconds). The existing endpoint validates, extracts audio, and writes the English transcript.
