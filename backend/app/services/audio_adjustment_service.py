@@ -154,6 +154,8 @@ def adjust_audio_duration(
         "-hide_banner",
         "-loglevel",
         "error",
+        "-protocol_whitelist",
+        "file,crypto",
         "-y",
         "-i",
         str(resolved_input_path),

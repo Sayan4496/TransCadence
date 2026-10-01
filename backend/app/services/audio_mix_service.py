@@ -151,6 +151,8 @@ def mix_audio(
         "-hide_banner",
         "-loglevel",
         "error",
+        "-protocol_whitelist",
+        "file,crypto",
         "-y",
         "-i",
         str(original_path),

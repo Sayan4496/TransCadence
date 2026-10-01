@@ -401,6 +401,8 @@ def _compose_speech_timeline(
         "-hide_banner",
         "-loglevel",
         "error",
+        "-protocol_whitelist",
+        "file,crypto",
         "-y",
     ]
     filter_parts = []

@@ -22,8 +22,7 @@ const navigation = [
 function Sidebar() {
   return <aside className="sidebar">
     <NavLink className="brand" to="/" aria-label="TransCadence home">
-      <span className="brand-mark"><Video size={21} /></span>
-      <span><strong>Trans<span>Cadence</span></strong><small>One Video. Every Language.</small></span>
+      <img className="brand-logo" src="/assets/logo.png" alt="TransCadence logo" />
     </NavLink>
     <nav className="side-nav" aria-label="Main navigation">
       {navigation.map(({ label, path, Icon }) => <NavLink key={path} to={path} end={path === '/'} className={({ isActive }) => `nav-link${isActive ? ' active' : ''}`}>
@@ -142,6 +141,7 @@ function HomePage({ jobs, onUploaded, onOpen }: { jobs: SavedJob[]; onUploaded: 
 
 function TranslatePage({ job, videoUrl, updateJob }: { job?: SavedJob; videoUrl?: string; updateJob: (job: SavedJob) => void }) {
   const [busy, setBusy] = useState(false);
+  const [hindiSelected, setHindiSelected] = useState(true);
   const [message, setMessage] = useState('');
   const [status, setStatus] = useState<JobStatus>();
   const processingRef = useRef(false);
@@ -210,9 +210,9 @@ function TranslatePage({ job, videoUrl, updateJob }: { job?: SavedJob; videoUrl?
         {message && !failed && <div className="inline-error" role="alert">{message}</div>}
       </section>
       <aside className="language-panel"><span className="panel-icon"><Languages size={20} /></span><h2>Select target language</h2><p>Choose a supported language for your video.</p>
-        <label className="language-option"><span className="flag">🇮🇳</span><span><strong>हिन्दी</strong><small>Hindi · Available</small></span><span className="checked"><Check size={15} /></span></label>
+        <button className={`language-option${hindiSelected ? ' selected' : ''}`} type="button" aria-pressed={hindiSelected} disabled={busy} onClick={() => setHindiSelected((selected) => !selected)}><span className="flag">🇮🇳</span><span><strong>हिन्दी</strong><small>Hindi · Available</small></span>{hindiSelected && <span className="checked"><Check size={15} /></span>}</button>
         <p className="support-note">Hindi dubbing is currently the only supported target language.</p>
-        <button className="primary-button continue-button" type="button" disabled={!job || busy || completed} onClick={() => void startDubbing()}>{busy ? <><LoaderCircle className="spin" size={17} />Processing</> : completed ? <><CheckCircle2 size={17} />Complete</> : <>Continue <ArrowRight size={17} /></>}</button>
+        <button className="primary-button continue-button" type="button" disabled={!job || !hindiSelected || busy || completed} onClick={() => void startDubbing()}>{busy ? <><LoaderCircle className="spin" size={17} />Processing</> : completed ? <><CheckCircle2 size={17} />Complete</> : <>Continue <ArrowRight size={17} /></>}</button>
         {!job && <p className="panel-hint">Upload a video to enable translation.</p>}
       </aside>
     </div>
@@ -263,8 +263,14 @@ function App() {
   const activeJob = useMemo(() => jobs.find((job) => job.job_id === activeJobId) || jobs[0], [jobs, activeJobId]);
 
   useEffect(() => {
-    document.documentElement.dataset.theme = theme === 'system' ? (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light') : theme;
+    const systemTheme = window.matchMedia('(prefers-color-scheme: dark)');
+    const applyTheme = () => {
+      document.documentElement.dataset.theme = theme === 'system' ? (systemTheme.matches ? 'dark' : 'light') : theme;
+    };
+    applyTheme();
     localStorage.setItem('transcadence_theme', theme);
+    systemTheme.addEventListener('change', applyTheme);
+    return () => systemTheme.removeEventListener('change', applyTheme);
   }, [theme]);
 
   useEffect(() => {

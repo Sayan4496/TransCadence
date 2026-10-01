@@ -197,6 +197,8 @@ def generate_dubbed_video(
         "-hide_banner",
         "-loglevel",
         "error",
+        "-protocol_whitelist",
+        "file,crypto",
         "-y",
         "-i",
         str(video),
